@@ -1,0 +1,603 @@
+import com.sdl.dxa.builder.configuration.parameters.Parameter
+import com.sdl.dxa.builder.configuration.parameters.PropertiesFileProperty
+import com.sdl.dxa.builder.configuration.parameters.Property
+import com.sdl.dxa.builder.configuration.parameters.XmlProperty
+import com.sdl.dxa.builder.configuration.parameters.ReplaceRegExpProperty
+import com.sdl.dxa.builder.maven.MavenBuildTask
+import groovy.json.JsonBuilder
+import groovy.json.JsonSlurper
+import org.jdom2.Namespace
+
+import static com.sdl.dxa.builder.configuration.parameters.Validator.*
+
+buildscript {
+    repositories {
+        if (System.properties['snapshots.maven.repo']) {
+            maven {
+                url System.properties['snapshots.maven.repo'].replace("\\", "\\\\")
+            }
+        }
+        mavenLocal()
+        mavenCentral()
+        maven {
+            url 'https://oss.sonatype.org/content/repositories/snapshots'
+        }
+    }
+    dependencies {
+        classpath group: 'com.sdl.dxa', name: 'dxa-builder', version: '2.2.0', changing: true
+    }
+}
+
+wrapper() {
+    gradleVersion = '4.10.3'
+    distributionUrl = "https://services.gradle.org/distributions/gradle-$gradleVersion-all.zip"
+}
+
+boolean isWindows = org.gradle.internal.os.OperatingSystem.current().windows
+boolean isBatch = project.hasProperty('batch')
+boolean isVerbose = project.hasProperty('verbose')
+boolean isNsu = System.properties['snapshots.maven.repo'] != null
+String webappName = 'dxa-webapp'
+def getResource = { String name -> "${webappName}/src/main/resources/${name}" }
+
+def configuration = [
+        modules   : new Parameter()
+                .withDescription('Specify list of DXA modules, "-" for empty list')
+                .withDefaultValue(project, 'modules', 'core')
+                .withValidator(commaInputFromList(['core', 'search', 'smarttarget', 'cid', '51degrees', 'googleanalytics',
+                                                   'mediamanager', 'context-expressions', 'audience-manager', 'ugc', 'dd', 'tridion-docs-search', 'tridion-docs-mashup', 'test'])),
+
+        parameters: [
+                sitesVersion: new Parameter()
+                        .withDescription('What version of CM is used?')
+                        .withDefaultValue(project, 'sitesVersion', '9')
+                        .withValidator(valueInList('8', '9'))
+                        .withProperties(
+                                new PropertiesFileProperty().withName('spring.profiles.active')
+                                        .shouldAppend()
+                                        .withMapping("8 -> cil.providers.active; 9 -> ")
+                                        .inFile(getResource("dxa.properties"))
+                        ),
+                deployType         : new Parameter()
+                        .withDescription('What is type of deployment?')
+                        .withDefaultValue(project, 'deployType', 'staging')
+                        .withValidator(valueInList('staging', 'live')),
+
+                navigationType     : new Parameter()
+                        .withDescription('What is type of navigation provider?')
+                        .withDefaultValue(project, 'navigationType', 'static')
+                        .withValidator(valueInList('static', 'dynamic'))
+                        .withProperties(
+                            new PropertiesFileProperty().withName('spring.profiles.active')
+                                    .shouldAppend()
+                                    .withMapping("static -> ; dynamic -> dynamic.navigation.provider")
+                                    .inFile(getResource("dxa.properties"))
+                        ),
+
+                connectionTimeout     : new Parameter()
+                        .withDescription('What is connection timeout in ms?')
+                        .withDefaultValue(project, 'connectionTimeout', '10000')
+                        .withValidator(intNumber())
+                        .withProperties(
+                                new XmlProperty()
+                                        .thatModifiesXml('/ServiceConfig/@ConnectionTimeout')
+                                        .inFile(getResource("cd_client_conf.xml"))
+                                        .wrappedWith('${CONNECTION_TIMEOUT:-', '}')
+                        ),
+                cacheType          : new Parameter()
+                        .versionAdded("1.7.0")
+                        .withDescription('What is type of CIL caching?')
+                        .withDefaultValue(project, 'cil.caching', 'memory')
+                        .withValidator(valueInList('memory', 'redis'))
+                        .withProperties(
+                            new XmlProperty()
+                                    .thatModifiesXml('/ServiceConfig/@CacheProviderClass')
+                                    .inFile(getResource("cd_client_conf.xml"))
+                                    .withMapping("memory -> com.sdl.web.client.cache.GeneralCacheProvider; redis -> com.sdl.web.client.cache.distributed.RedisCacheProvider")
+                        ),
+
+                cacheConnectionTimeout     : new Parameter()
+                        .withDescription('What is ache connection timeout in ms?')
+                        .withDefaultValue(project, 'cacheConnectionTimeout', '10000')
+                        .withValidator(intNumber())
+                        .withProperties(
+                                new XmlProperty()
+                                        .thatModifiesXml('/ServiceConfig/@CacheConnectionTimeout')
+                                        .inFile(getResource("cd_client_conf.xml"))
+                                        .wrappedWith('${CACHE_CONNECTION_TIMEOUT:-', '}')
+                        ),
+
+                logLevel           : new Parameter()
+                        .withDescription("What is log level?")
+                        .withDefaultValue(project, 'logLevel', 'INFO')
+                        .withValidator(valueInList('TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'))
+                        .withCaseSensitiveValue()
+                        .withProperties(
+                            new XmlProperty()
+                                .thatModifiesXml("/configuration/property[@name='log.level']/@value")
+                                .inFile(getResource('logback.xml'))
+                        ),
+
+                cilLogLevel        : new Parameter()
+                        .versionAdded("1.7.0")
+                        .withDescription('What is CIL log level?')
+                        .withValidator(valueInList('TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'))
+                        .withCaseSensitiveValue()
+                        .withProperties(
+                            new XmlProperty()
+                                    .thatModifiesXml("/configuration/property[@name='cil.log.level']/@value")
+                                    .inFile(getResource('logback.xml'))
+                        )
+                        .withDynamicDefault(
+                        { configuration ->
+                            (project.hasProperty('cilLogLevel') ? project['cilLogLevel'] : configuration.parameters.logLevel.get()) as String
+                        }),
+
+                logFolder         : new Parameter()
+                        .withDescription("What would be the location of the log folder?")
+                        .withDefaultValue(project, 'logFolder', isWindows ? 'C:/SDLWeb/log' : '${user.home}/SDLWeb/log')
+                        .withCaseSensitiveValue()
+                        .withSystemEnv('LOG_FOLDER')
+                        .withValidator(notEmpty())
+                        .withProperties(
+                            new XmlProperty()
+                                    .thatModifiesXml("/configuration/property[@name='log.folder']/@value")
+                                    .wrappedWith('${LOG_FOLDER:-', '}')
+                                    .inFile(getResource('logback.xml'))
+                        ),
+
+                adf                : new Parameter()
+                        .withDescription('Is Ambient Data Framework (ADF) Enabled?')
+                        .withDefaultValue(project, 'adf.enabled', null)
+                        .withValidator(valueInList('yes', 'no'))
+                        .withProperties(
+                            new PropertiesFileProperty().withName('spring.profiles.active')
+                                    .shouldAppend()
+                                    .withMapping("yes -> adf.context.provider; no -> ")
+                                    .inFile(getResource("dxa.properties")),
+                            new PropertiesFileProperty().withName('dxa.web.adf.enabled')
+                                    .withMapping("yes -> true; no -> false")
+                                    .inFile(getResource("dxa.properties"))
+                        )
+                        .withDynamicDefault(
+                        { configuration ->
+                            //noinspection GroovyAssignabilityCheck
+                            if (configuration.modules.get().contains('context-expressions') &&
+                                    (new Parameter()
+                                            .withDescription("Is CIS version lower than 8.5?")
+                                            .withDefaultValue(project, 'cisIsOld', null)
+                                            .withValidator(valueInList("yes", "no"))
+                                            .process(isBatch) as String).trim() == "yes") {
+
+                                println ''
+                                println 'IMPORTANT: Context Expressions Module will not work without ADF enabled!'
+                                return 'yes'
+                            }
+                            'no'
+                        }),
+
+                cacheDuration      : new Parameter()
+                        .withDescription('What is Cache Expiration Duration (seconds)?')
+                        .withDynamicDefault(
+                        { configuration ->
+                            if (project.hasProperty('cacheDuration')) {
+                                return project['cacheDuration'] as String
+                            }
+                            configuration.parameters.deployType.value == 'staging' ? '5' : '300'
+                        })
+                        .withValidator(intNumber())
+                        .withProperties(
+                                new XmlProperty().thatModifiesXml(Namespace.getNamespace("v3", "http://www.ehcache.org/v3"),
+                                        "/v3:config/v3:cache-template/v3:expiry/v3:ttl/text()")
+                                        .inFile(getResource('ehcache.xml')),
+                                new XmlProperty()
+                                        .thatModifiesXml("/ServiceConfig/@CacheExpirationDuration")
+                                        .inFile(getResource('cd_client_conf.xml'))
+                        ),
+
+                discoveryUrl       : new Parameter()
+                        .withDescription('What is Discovery URL?')
+                        .withDefaultValue(project, 'discoveryUrl', null)
+                        .withValidator(or(url(), ip()))
+                        .withProperties(
+                            new XmlProperty()
+                                .thatModifiesXml("/ServiceConfig/DiscoveryService/@ServiceUri")
+                                .inFile(getResource('cd_client_conf.xml'))
+                                .wrappedWith('${DISCOVERY_URL:-', '}'),
+                        ),
+                cdUserPassword       : new Parameter()
+                        .withDescription("What is user's password for connection to Discovery Service?")
+                        .withDefaultValue(project, 'cdUserPassword', "CDUserP@ssw0rd")
+                        .withCaseSensitiveValue()
+                        .withProperties(
+                            new XmlProperty()
+                                .thatModifiesXml("/ServiceConfig/TokenService/@ClientSecret")
+                                .inFile(getResource('cd_client_conf.xml'))
+                                .wrappedWith('${cduserpassword:-', '}'),
+                        ),
+                'model.service.url': new Parameter()
+                        .versionAdded("2.0")
+                        .withDescription("Do you want to use a pre-configured URL for Model Service instead of using one from Discovery?")
+                        .withDefaultValue(project, "model.service.url", 'no')
+                        .withValidator(or(url(), ip(), valueInList('no')))
+                        .withProperties(
+                            new PropertiesFileProperty(name: 'dxa.model.service.url')
+                                .inFile(getResource('dxa.properties'))
+                                .withMapping('no -> $null$; $self$')
+                        )
+        ],
+
+        extras    : [
+                'modules.51degrees': [
+                        '51degrees.license': new Parameter()
+                                .withDescription("What is license for 51 Degrees module?")
+                                .withDefaultValue(project, '51degrees.license', '')
+                                .withCaseSensitiveValue()
+                                .withProperties(
+                                    new PropertiesFileProperty(name: 'dxa.modules.51degrees.license')
+                                            .inFile(getResource("dxa.addons.51degrees.properties"))
+                                )
+                ],
+                'modules.search'   : [
+                        'search.type': new Parameter()
+                                .withDescription('Which search provider do you want to use?')
+                                .withDefaultValue(project, 'search.type', 'solr')
+                                .withValidator(valueInList('solr', 'aws'))
+                                .withProperties(
+                                    new PropertiesFileProperty(name: 'spring.profiles.include')
+                                            .inFile(getResource('dxa.addons.search.properties'))
+                                            .withMapping('solr -> search.solr; aws -> search.aws')
+                                )
+                ],
+                'cacheType.redis'  : [
+                        'CacheClientId': new Parameter()
+                                .versionAdded("1.7.0")
+                                .withDescription("What is distributed Caching Client ID?")
+                                .withDefaultValue(project, "cache.redis.clientId", "dxa-application")
+                                .withCaseSensitiveValue()
+                                .withValidator(notEmpty())
+                                .withProperties(
+                                    new XmlProperty()
+                                        .thatAddsXmlAttributes(['/ServiceConfig': 'CacheClientId'])
+                                        .inFile(getResource("cd_client_conf.xml"))
+                                ),
+
+                        'CachePassword': new Parameter()
+                                .versionAdded("1.7.0")
+                                .withDescription("What is password for Redis Cache?")
+                                .withCaseSensitiveValue()
+                                .withDefaultValue(project, "cache.redis.password", '')
+                                .withProperties(
+                                    new XmlProperty()
+                                            .thatAddsXmlAttributes(['/ServiceConfig': 'CachePassword'])
+                                            .inFile(getResource("cd_client_conf.xml"))
+                                ),
+
+                        'CacheUri'     : new Parameter()
+                                .versionAdded("1.7.0")
+                                .withDescription("What is URI for Redis Cache ('hostname:port/path', port and path are optional)?")
+                                .withDefaultValue(project, 'cache.redis.url', null)
+                                .withValidator(domainName(true))
+                                .withProperties(
+                                    new XmlProperty()
+                                        .thatModifiesXml('/ServiceConfig/@CacheUri')
+                                        .inFile(getResource("cd_client_conf.xml"))
+                                )
+                ],
+                'modules.dd'   : [
+                        'active.features': new Parameter()
+                                .versionAdded("2.1")
+                                .withDescription('Which Active features do you want to use?')
+                                .withDefaultValue(project, 'active.features', '')
+                                .withCaseSensitiveValue()
+                                .withProperties(
+                                    new PropertiesFileProperty(name: 'active.features')
+                                            .inFile(getResource('dxa.addons.docs.properties'))
+                                ),
+                        'content.evaluate': new Parameter()
+                                .versionAdded("2.1")
+                                .withDescription('Must content evaluation be enabled?')
+                                .withDefaultValue(project, 'content.evaluate', 'false')
+                                .withValidator(valueInList('true', 'false'))
+                                .withCaseSensitiveValue()
+                                .withProperties(
+                                    new PropertiesFileProperty(name: 'content.evaluate')
+                                            .inFile(getResource('dxa.addons.docs.properties'))
+                                )
+                ],
+                'modules.tridion-docs-search'   : [
+                        'queryClient': new Parameter()
+                                .versionAdded("2.1")
+                                .withDescription('Which Query Client class do you want to use?')
+                                .withDefaultValue(project, 'queryClient', 'RestQueryClient')
+                                .withCaseSensitiveValue()
+                                .withValidator(valueInList('RestQueryClient'))
+                                .withProperties(
+                                    new ReplaceRegExpProperty()
+                                        .thatReplaces('', '', '</ServiceConfig>')
+                                        .wrappedWith('\n    <QueryClient Class="', '">\n        <QueryProvider Type="elasticsearch"/>\n    </QueryClient>\n')
+                                        .withMapping("RestQueryClient -> com.sdl.delivery.iq.query.client.rest.RestQueryClient; dummy -> ")
+                                        .inFile(getResource("cd_client_conf.xml"))
+                                ),
+                        'queryProvider': new Parameter()
+                                .versionAdded("2.1")
+                                .withDescription('Which Query Client class do you want to use?')
+                                .withDefaultValue(project, 'queryProvider', 'elasticsearch')
+                                .withCaseSensitiveValue()
+                                .withValidator(valueInList('elasticsearch'))
+                                .withProperties(
+                                    new XmlProperty()
+                                        .thatModifiesXml('/ServiceConfig/QueryClient/QueryProvider/@Type')
+                                        .inFile(getResource("cd_client_conf.xml"))
+                                ),
+                        'defaultIndex': new Parameter()
+                                .versionAdded("2.1")
+                                .withDescription('What Indexname do you want to use?')
+                                .withDynamicDefault(
+                                { configuration ->
+                                    if (project.hasProperty('defaultIndex')) {
+                                        return project['defaultIndex'] as String
+                                    }
+                                    configuration.parameters.deployType.value == 'staging' ? 'stagingudp-index' : 'liveudp-index'
+                                })
+                                .withProperties(
+                                    new ReplaceRegExpProperty()
+                                        .thatReplaces('', '', '</ServiceConfig>')
+                                        .wrappedWith('\n    <DefaultIndex IndexName="', '"/>\n')
+                                        .inFile(getResource("cd_client_conf.xml"))
+                                )
+                ],
+                'modules.smarttarget'   : [
+                        'queryClient': new Parameter()
+                                .versionAdded("2.1")
+                                .withDescription('Which Query Client class do you want to use?')
+                                .withDefaultValue(project, 'queryClient', 'RestQueryClient')
+                                .withCaseSensitiveValue()
+                                .withValidator(valueInList('RestQueryClient'))
+                                .withProperties(
+                                    new ReplaceRegExpProperty()
+                                        .thatReplaces('', '', '</ServiceConfig>')
+                                        .wrappedWith('\n    <QueryClient Class="', '">\n        <QueryProvider Type="elasticsearch"/>\n    </QueryClient>\n')
+                                        .withMapping("RestQueryClient -> com.sdl.delivery.iq.query.client.rest.RestQueryClient; dummy -> ")
+                                        .inFile(getResource("cd_client_conf.xml"))
+                                ),
+                        'queryProvider': new Parameter()
+                                .versionAdded("2.1")
+                                .withDescription('Which Query Client class do you want to use?')
+                                .withDefaultValue(project, 'queryProvider', 'elasticsearch')
+                                .withCaseSensitiveValue()
+                                .withValidator(valueInList('elasticsearch'))
+                                .withProperties(
+                                    new XmlProperty()
+                                        .thatModifiesXml('/ServiceConfig/QueryClient/QueryProvider/@Type')
+                                        .inFile(getResource("cd_client_conf.xml"))
+                                )
+                ]
+        ]
+]
+
+help {
+    doLast {
+        def execFile = "prepare${org.gradle.internal.os.OperatingSystem.current().windows ? '.bat' : '.sh'}"
+        println """
+DXA Java installation tool
+==========================
+This tool is an interactive script to install the Java version of SDL Digital Experience Accelerator (DXA) for SDL Web 8.
+==========================
+
+Use the tool as following:
+
+    $execFile <list of tasks> <application parameters> <script parameters>
+
+    <list of tasks> is a list of space-separated Gradle tasks.
+        If <list of tasks> is empty, then the default is '${defaultTasks[0]}'.
+        Possible values are:
+            mainFlow    Default task. Builds the DXA application.
+
+            prepare     To enable the preparation flow, that stops right after resources copying. Allows to modify configuration files before packig them.
+                        Is to be used before 'generate' task. Together they form a 'prepare & generate' flow with a stop in the middle for advanced changes in configuration.
+            generate    To pack the application after 'prepare' task.
+                        Is to be used after 'prepare' task. Together they form a 'prepare & generate' flow with a stop in the middle for advanced changes in configuration.
+                        Its result is basically the same as in mainFlow.
+                        You don't need to specify application parameters for 'generate' task. They are persisted from 'prepare'.
+
+            help        Shows this help.
+
+            params      Shows all the possible params that the tool can work with. Those are requested in interactive mode, and can be passed into in non-interactive.
+
+    <application parameters> is a space-separated list of parameters specified using syntax '-PparamName=paramValue'. E.g. -Ptype=web8
+        To get a list of parameters run this script as '$execFile params'. In interactive mode you will be requested to provide values for them.
+        Note that space characters in paramValue require it to be double-quotes.
+
+    <script parameters> is a space-separated list of parameters specified using syntax '-PparamName'. E.g. -Pbatch
+        These parameters define how the tool works and are not related to DXA application itself.
+        Possible values are:
+            batch       Specified as '-Pbatch'. Enables non-interactive mode. The tool will not interact with you.
+
+            verbose     Specified as '-Pverbose'. Enables verbose debug mode. The tool will pring everything during execution.
+
+            -Dsnapshots.maven.repo    
+                        Specified as '-Dsnapshots.maven.repo=VALUE'. Enables NSU (no snapshots update) mode for Maven. 
+                        This means Maven will use Snapshots from the given folder. 
+                        In case they're not found, it will try to resolve them using a default approach.
+                        There is no any check is snapshots are present, and the result is not predictable.
+                        NB! This property has a value.
+                        NB! This property should be specified using '-D' prefix instead of '-P'! E.g.: -D snapshots.maven.repo=D:\\repo
+                        
+
+            mavenProperties
+                        Specified as '-PmavenProperties=VALUE'. NB! This property has a value. Properties will be passed to Maven as is.
+
+
+==========================
+Q: Can I stop the script when it's requesting a parameter value?
+A: Yes. To stop the script execution set any parameter value to 'halt'.
+
+Q: Can I specify the version of DXA?
+A: Yes. You need to pass the -Pversion=VERSION parameter to a script. Note that the tool works only for DXA 1.6+.
+
+Q: How can I specify parameters in CLI?
+A: You can specify them as a list when you run the tool. The parameters specified in CLI will get a new default value from it. Examples:
+    $execFile -Ptype=web8 -PdiscoveryUrl=localhost
+    $execFile -Ptype=web8 -PdiscoveryUrl=localhost -Pmodules="googleanalytics, mediamanager, context-expressions" -Pbatch
+
+Q: What do I need to install for this tool?
+A: You need Java 8+ and Maven 3.2.2+ available in PATH.
+
+Q: What do I get as a result?
+A: Folder '${webappName}' with Maven project inside and a WAR file in 'target' folder which is just the same project but compiled. The Maven project is ready to be imported to your favorite IDE.
+"""
+    }
+}
+
+task params {
+    doLast {
+        println """
+List of possible properties in the following format:
+
+    Name of the properties: Way it may be configured from CLI
+    Validation rules
+    """
+        def printProperty
+        printProperty = { k, v ->
+            if (v instanceof Parameter) {
+                println ''
+                println "${v.description}: -P${k}=VALUE"
+                v.validator?.describe()
+            } else {
+                //noinspection GroovyAssignabilityCheck
+                v.each printProperty
+            }
+        }
+        configuration.each printProperty
+    }
+}
+
+def targetFolder = "${webappName}/target"
+def buildConfigurationsFileName = "$targetFolder/build-configurations"
+def introduce = { String text ->
+    return {
+        println '==============='
+        println "${text}"
+        println ''
+    }
+}
+
+defaultTasks 'mainFlow'
+
+task cleaning(type: Delete)
+cleaning.doFirst introduce('I am cleaning working directories before script run')
+
+task requestParameters
+requestParameters.doFirst introduce('I am requesting all the needed parameters and configuring further tasks. Type \'halt\' to stop')
+
+task archetype(dependsOn: [cleaning, requestParameters], type: MavenBuildTask)
+archetype.doFirst introduce('I am generating a scratch web application')
+
+task addResources(dependsOn: [archetype, requestParameters], type: Copy)
+addResources.doFirst introduce('I am adding additional resources (like libs or configurations) for your configuration')
+
+task filterResources(dependsOn: [archetype, requestParameters, addResources])
+filterResources.doFirst introduce("I am filtering resource files settings all properties in a '${webappName}/src/main/resources' directory")
+
+def webappIntroduce = introduce('I am building a WAR file for you')
+task webappPrepareFlow(type: MavenBuildTask) {
+    def buildConfigurations = new File(buildConfigurationsFileName)
+    if (buildConfigurations.exists()) {
+        configurations = new JsonSlurper().parseText(buildConfigurations.text)
+    }
+}
+webappPrepareFlow.doFirst webappIntroduce
+
+task webapp(dependsOn: [archetype, filterResources], type: MavenBuildTask)
+webapp.doFirst webappIntroduce
+
+task prepare(dependsOn: [cleaning, requestParameters, archetype, addResources, filterResources])
+prepare.doFirst introduce("I am the preparation task. Your resources are prepared in ${webappName}/src/main/resources folder. Customize them if you need, and run the final step 'generate'")
+prepare.doLast {
+    new File(targetFolder).mkdirs()
+    new File(buildConfigurationsFileName).write(new JsonBuilder(webapp.configurations).toPrettyString())
+}
+
+task generate(dependsOn: [webappPrepareFlow])
+generate.doFirst introduce("I am the generation task, I made it work. Your application is in ${webappName}/target")
+
+task mainFlow(dependsOn: [cleaning, requestParameters, archetype, addResources, filterResources, webapp])
+mainFlow.doFirst introduce("I am the main task, and made all previous tasks work! Your application is in ${webappName}/target")
+
+def mavenSettings = {
+    verbose = isVerbose
+    mavenProperties = '-DskipTests=true ' + (isNsu ? '-nsu ' : '') +
+            (System.properties['snapshots.maven.repo'] ? "-Dmaven.repo.local=\"${System.properties['snapshots.maven.repo']}\" " : '') +
+            (project.hasProperty('mavenProperties') ? project['mavenProperties'] : '')
+    batch = isBatch
+}
+archetype mavenSettings
+webappPrepareFlow mavenSettings
+webapp mavenSettings
+
+cleaning {
+    delete buildDir
+    delete webappName
+}
+
+requestParameters.doLast {
+    Map<Property, String> properties = [:]
+
+    def modules = configuration.modules.request(properties, version, isBatch, configuration)
+
+    def modulesList = modules.tokenize(' ,')
+    def extrasList = modulesList.collect { "modules.$it" }.toSet()
+
+    configuration.parameters.each {
+        def parameter = (it.value as Parameter).request(properties, version, isBatch, configuration)
+        if (parameter) {
+            extrasList.add("${it.key}.${parameter.toString().replaceAll(/[^a-zA-Z0-9.-]/, '')}")
+        }
+    }
+
+    extrasList.each { extra ->
+        (configuration.extras[extra] as Map)?.each {
+            (it.value as Parameter).request(properties, version, isBatch, configuration)
+        }
+    }
+
+    addResources {
+        extrasList.each {
+            from("extras/${it}") {
+                include '**/*.*'
+                into "resources"
+            }
+        }
+        into "${webappName}/src/main"
+    }
+
+    properties.each {
+        def property = it.key
+        def value = property.deriveValue(it.value)
+
+        filterResources.doLast {
+            property.files.each { String filename ->
+                property.processProperty(filename, value)
+            }
+        }
+    }
+
+    webapp {
+        def buildProps = []
+        if ('-' != modules) {
+            buildProps.add('-P' + modulesList.collect {
+                "${it}-module"
+            }.join(","))
+        }
+        configurations = [["> ${webappName} > package ${buildProps.join(' ')}"]]
+    }
+}
+
+archetype {
+    configurations = [
+            ['>> archetype:crawl'],
+            [">> archetype:generate -B -DarchetypeArtifactId=dxa-webapp-archetype -DarchetypeGroupId=com.sdl.dxa -DarchetypeVersion=${version} " +
+                     "-DgroupId=org.example -DartifactId=${webappName} -Dversion=${version}"]
+    ]
+}
