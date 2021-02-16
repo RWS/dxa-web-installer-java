@@ -165,7 +165,7 @@ def configuration = [
                             if (configuration.modules.get().contains('context-expressions') &&
                                     (new Parameter()
                                             .withDescription("Is CIS version lower than 8.5?")
-                                            .withDefaultValue(project, 'cisIsOld', null)
+                                            .withDefaultValue(project, 'cisIsOld', "no")
                                             .withValidator(valueInList("yes", "no"))
                                             .process(isBatch) as String).trim() == "yes") {
 
