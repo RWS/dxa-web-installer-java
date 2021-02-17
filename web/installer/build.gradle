@@ -41,12 +41,12 @@ String webappName = 'dxa-webapp'
 def getResource = { String name -> "${webappName}/src/main/resources/${name}" }
 
 def configuration = [
+
         modules   : new Parameter()
                 .withDescription('Specify list of DXA modules, "-" for empty list')
                 .withDefaultValue(project, 'modules', 'core')
                 .withValidator(commaInputFromList(['core', 'search', 'smarttarget', 'cid', '51degrees', 'googleanalytics',
                                                    'mediamanager', 'context-expressions', 'audience-manager', 'ugc', 'dd', 'tridion-docs-search', 'tridion-docs-mashup', 'test'])),
-
         parameters: [
                 sitesVersion: new Parameter()
                         .withDescription('What version of CM is used?')
@@ -455,15 +455,19 @@ task params {
         println """
 List of possible properties in the following format:
 
-    Name of the properties: Way it may be configured from CLI
-    Validation rules
+    Name of the property: the way it may be configured
+    Description of the property: the explanation what the parameter is used for
+    Validation rules: possible restrictions for parameter
     """
         def printProperty
         printProperty = { k, v ->
             if (v instanceof Parameter) {
                 println ''
-                println "${v.description}: -P${k}=VALUE"
-                v.validator?.describe()
+                println "-P${k}=VALUE"
+                println "${v.description}"
+                if (v.validator) {
+                    v.validator.describe()
+                } else println "-"
             } else {
                 //noinspection GroovyAssignabilityCheck
                 v.each printProperty
